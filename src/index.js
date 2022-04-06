@@ -1,3 +1,5 @@
+/* eslint-env node */
+
 import path from "path";
 import loaderUtils from "loader-utils";
 
@@ -36,28 +38,18 @@ function exportDeclarationHook(parser, handler) {
 loader.pitch = function (request) {
 	this.cacheable(false);
 
-	const options = loaderUtils.getOptions(this) || {};
-
+	const options = this.getOptions();
 	const cb = this.async();
-
-	const filename = loaderUtils.interpolateName(
-		this,
-		`${options.name || "[hash]"}.worker.js`,
-		{
-			context: options.context || this.rootContext || this.options.context,
-			regExp: options.regExp,
-		}
-	);
-
+	const compilerOptions = this._compiler.options || {};
+	const filename = (options.name || "[fullhash]") + ".worker.js";
 	const worker = {};
-
 	worker.options = {
 		filename,
-		chunkFilename: `[id].${filename}`,
-		namedChunkFilename: null,
+		chunkFilename: filename,
+		publicPath: options.publicPath || compilerOptions.output.publicPath,
+		globalObject: "self",
 	};
 
-	const compilerOptions = this._compiler.options || {};
 	if (
 		compilerOptions.output &&
 		compilerOptions.output.globalObject === "window"
@@ -68,7 +60,7 @@ loader.pitch = function (request) {
 	}
 
 	worker.compiler = this._compilation.createChildCompiler(
-		"worker",
+		`worker ${request}`,
 		worker.options
 	);
 
@@ -96,32 +88,32 @@ loader.pitch = function (request) {
 		}).apply(worker.compiler);
 	}
 
+	const bundleName = path.parse(this.resourcePath).name;
+
 	new SingleEntryPlugin(
 		this.context,
 		`!!${path.resolve(__dirname, "rpc-worker-loader.js")}!${request}`,
-		"main"
+		bundleName
 	).apply(worker.compiler);
 
-	const subCache = `subcache ${__dirname} ${request}`;
-
 	compilationHook(worker.compiler, (compilation, data) => {
-		if (compilation.cache) {
-			if (!compilation.cache[subCache]) compilation.cache[subCache] = {};
-
-			compilation.cache = compilation.cache[subCache];
-		}
-		parseHook(data, (parser, options) => {
+		parseHook(data, (parser) => {
 			exportDeclarationHook(parser, (expr) => {
-				let decl = expr.declaration || expr,
-					{ compilation, current } = parser.state,
-					entry = compilation.entries[0].resource;
+				const decl = expr.declaration || expr;
+				const { compilation: stateCompilation, current } = parser.state;
+
+				const entryModule =
+					stateCompilation.entries instanceof Map
+						? stateCompilation.moduleGraph.getModule(
+								stateCompilation.entries.get(bundleName).dependencies[0]
+						  )
+						: stateCompilation.entries[0];
 
 				// only process entry exports
-				if (current.resource !== entry) return;
+				if (current.resource !== entryModule.resource) return;
 
-				let key = current.nameForCondition();
-				let exports = CACHE[key] || (CACHE[key] = {});
-
+				const key = current.nameForCondition();
+				const exports = CACHE[key] || (CACHE[key] = {});
 				if (decl.id) {
 					exports[decl.id.name] = true;
 				} else if (decl.declarations) {
@@ -131,6 +123,26 @@ loader.pitch = function (request) {
 				} else {
 					console.warn("[workerize] unknown export declaration: ", expr);
 				}
+
+				// This is for Webpack 5: mark the exports as used so it does not get tree-shaken away on production build
+				if (compilation.moduleGraph) {
+					const { getEntryRuntime } = require("webpack/lib/util/runtime");
+					const { UsageState } = require("webpack");
+					const runtime = getEntryRuntime(compilation, bundleName);
+					for (const exportName of Object.keys(exports)) {
+						const exportInfo = compilation.moduleGraph.getExportInfo(
+							entryModule,
+							exportName
+						);
+						exportInfo.setUsed(UsageState.Used, runtime);
+						exportInfo.canMangleUse = false;
+						exportInfo.canMangleProvide = false;
+					}
+					compilation.moduleGraph.addExtraReason(
+						entryModule,
+						"used by workerize-loader"
+					);
+				}
 			});
 		});
 	});
@@ -139,13 +151,22 @@ loader.pitch = function (request) {
 		if (err) return cb(err);
 
 		if (entries[0]) {
-			worker.file = entries[0].files[0];
+			worker.file = Array.from(entries[0].files)[0];
+			const entryModules =
+				compilation.chunkGraph &&
+				compilation.chunkGraph.getChunkEntryModulesIterable
+					? Array.from(
+							compilation.chunkGraph.getChunkEntryModulesIterable(entries[0])
+					  )
+					: null;
+			const entryModule =
+				entryModules && entryModules.length > 0
+					? entryModules[0]
+					: entries[0].entryModule;
+			const key = entryModule.nameForCondition();
 
-			let key = entries[0].entryModule.nameForCondition();
-			let contents = compilation.assets[worker.file].source();
-			let exports = Object.keys(CACHE[key] || {});
-
-			// console.log('Workerized exports: ', exports.join(', '));
+			const contents = compilation.assets[worker.file].source();
+			const exports = Object.keys(CACHE[key] || {});
 
 			if (options.inline) {
 				worker.url = `URL.createObjectURL(new Blob([${JSON.stringify(
@@ -166,6 +187,9 @@ loader.pitch = function (request) {
 				workerUrl = `"data:,importScripts('"+location.origin+${workerUrl}+"')"`;
 			}
 
+			// workerUrl will be URL.revokeObjectURL() to avoid memory leaks on browsers
+			// https://github.com/webpack-contrib/worker-loader/issues/208
+
 			return cb(
 				null,
 				`
@@ -176,6 +200,7 @@ loader.pitch = function (request) {
 				var methods = ${JSON.stringify(exports)}
 				module.exports = function() {
 					var w = new Worker(${workerUrl}, { name: ${JSON.stringify(filename)} })
+          URL.revokeObjectURL(${workerUrl});
 					addMethods(w, methods)
 					${
 						options.ready
